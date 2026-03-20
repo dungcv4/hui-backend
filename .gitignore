@@ -1,0 +1,42 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+venv/
+env/
+ENV/
+
+# Database files - never commit
+*.db
+*.sqlite3
+
+# Test artifacts
+test_reports/
+.pytest_cache/
+.coverage
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.backup
+*.original
+*.bak
+server.py.backup
+server.py.original
