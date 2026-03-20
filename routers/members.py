@@ -9,7 +9,20 @@ from typing import List
 from passlib.context import CryptContext
 
 from database import get_db
-from models import Member, User, UserRole, HuiMembership, HuiGroup, Payment, PaymentStatus, AuditLog
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from models import Member, User, UserRole, HuiMembership, HuiGroup, Payment, PaymentStatus, HuiSchedule, AuditLog
+from utils import calculate_member_payment_amount
+
+_VIETNAM_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
+
+
+def _get_vietnam_today_range():
+    """Trả naive datetime start/end của hôm nay theo giờ VN (để so sánh với DB)"""
+    now = datetime.now(_VIETNAM_TZ)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
+    end = start.replace(hour=23, minute=59, second=59)
+    return start, end
 from schemas import MemberCreate, MemberUpdate, MemberResponse
 from auth import get_current_user
 import logging
@@ -380,6 +393,111 @@ async def get_member_detail(
                 ]
             })
         
+        # ---- Today summary ----
+        today_start, today_end = _get_vietnam_today_range()
+        today_total_due = 0
+        today_total_receive = 0
+        today_details = []
+
+        for ms in memberships:
+            group = group_map.get(str(ms.hui_group_id))
+            if not group or not group.is_active:
+                continue
+
+            schedule = db.query(HuiSchedule).filter(
+                HuiSchedule.hui_group_id == group.id,
+                HuiSchedule.due_date >= today_start,
+                HuiSchedule.due_date <= today_end
+            ).first()
+
+            if not schedule:
+                continue
+
+            is_receiver = (schedule.receiver_membership_id == ms.id)
+            if is_receiver:
+                amount = schedule.distribution_amount or (group.amount_per_cycle * group.total_members)
+                today_total_receive += amount
+                today_details.append({
+                    "hui_group_id": str(group.id),
+                    "hui_group_name": group.name,
+                    "cycle_number": schedule.cycle_number,
+                    "type": "receive",
+                    "amount": amount,
+                    "payment_code": ms.payment_code,
+                })
+            else:
+                amount = calculate_member_payment_amount(group, ms, schedule.cycle_number)
+                # Check if already paid today
+                paid = db.query(Payment).filter(
+                    Payment.schedule_id == schedule.id,
+                    Payment.membership_id == ms.id,
+                    Payment.payment_status == PaymentStatus.VERIFIED
+                ).first()
+                status = "paid" if paid else "pending"
+                if not paid:
+                    today_total_due += amount
+                today_details.append({
+                    "hui_group_id": str(group.id),
+                    "hui_group_name": group.name,
+                    "cycle_number": schedule.cycle_number,
+                    "type": "pay",
+                    "amount": amount,
+                    "status": status,
+                    "payment_code": ms.payment_code,
+                })
+
+        # ---- Upcoming payments (next 5 cycles) ----
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        upcoming = []
+        for ms in memberships:
+            group = group_map.get(str(ms.hui_group_id))
+            if not group or not group.is_active:
+                continue
+            next_schedules = db.query(HuiSchedule).filter(
+                HuiSchedule.hui_group_id == group.id,
+                HuiSchedule.is_completed == False,
+                HuiSchedule.due_date > today_end,
+                HuiSchedule.receiver_membership_id != ms.id
+            ).order_by(HuiSchedule.due_date.asc()).limit(3).all()
+
+            for s in next_schedules:
+                days_until = (s.due_date - now_utc).days if s.due_date else None
+                upcoming.append({
+                    "hui_group_name": group.name,
+                    "cycle_number": s.cycle_number,
+                    "due_date": s.due_date.isoformat() if s.due_date else None,
+                    "amount": calculate_member_payment_amount(group, ms, s.cycle_number),
+                    "days_until": max(0, days_until) if days_until is not None else None,
+                })
+
+        upcoming.sort(key=lambda x: x.get("due_date") or "9999")
+        upcoming = upcoming[:5]
+
+        # ---- Next payout ----
+        next_payout = None
+        if not all(m.has_received for m in memberships):
+            pending_ms = [m for m in memberships if not m.has_received]
+            for ms in pending_ms:
+                group = group_map.get(str(ms.hui_group_id))
+                if not group:
+                    continue
+                recv_schedule = db.query(HuiSchedule).filter(
+                    HuiSchedule.hui_group_id == group.id,
+                    HuiSchedule.receiver_membership_id == ms.id,
+                    HuiSchedule.is_completed == False
+                ).order_by(HuiSchedule.due_date.asc()).first()
+                if recv_schedule:
+                    days_until = (recv_schedule.due_date - now_utc).days if recv_schedule.due_date else None
+                    candidate = {
+                        "hui_group_name": group.name,
+                        "cycle_number": recv_schedule.cycle_number,
+                        "due_date": recv_schedule.due_date.isoformat() if recv_schedule.due_date else None,
+                        "estimated_amount": recv_schedule.distribution_amount or (group.amount_per_cycle * group.total_members),
+                        "days_until": max(0, days_until) if days_until is not None else None,
+                    }
+                    if next_payout is None or (recv_schedule.due_date and recv_schedule.due_date < datetime.fromisoformat(next_payout["due_date"])):
+                        next_payout = candidate
+
         # Calculate overall stats
         overall_late_count = sum(m.total_late_count or 0 for m in memberships)
         overall_late_amount = sum(m.total_late_amount or 0 for m in memberships)
@@ -413,7 +531,16 @@ async def get_member_detail(
             "overall_risk_level": overall_risk,
             "total_late_count": overall_late_count,
             "total_late_amount": overall_late_amount,
-            "memberships": membership_details
+            "memberships": membership_details,
+            # New fields
+            "today_summary": {
+                "total_due": today_total_due,
+                "total_receive": today_total_receive,
+                "net": today_total_receive - today_total_due,
+                "details": today_details,
+            },
+            "upcoming_payments": upcoming,
+            "next_payout": next_payout,
         }
     
     except HTTPException:
