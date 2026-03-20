@@ -7,13 +7,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 # Create SQLAlchemy engine
-# Create SQLAlchemy engine
 connect_args = {}
-if settings.database_url.startswith("sqlite"):
+if settings.get_database_url().startswith("sqlite"):
     connect_args = {"check_same_thread": False}
 
 engine = create_engine(
-    settings.database_url,
+    settings.get_database_url(),
     connect_args=connect_args,
     pool_pre_ping=True,
     pool_recycle=3600,
